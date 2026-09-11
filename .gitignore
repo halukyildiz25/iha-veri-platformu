@@ -16,6 +16,13 @@ __pycache__/
 # --- Rust ---
 **/target/
 
+# DataProcessingManagement is its own nested git repo (required at runtime:
+# dagster/postgres_catalog.py resolves pipeline identity via git, and the
+# container only ever sees this folder, not this outer repo's .git). This
+# outer repo tracks its files as plain content instead of a submodule
+# gitlink, so only the inner .git internals are excluded here.
+DataProcessingManagement/.git/
+
 # --- generated / runtime data (regenerate via dvc repro or the app itself) ---
 DataProcessingManagement/data/raw/
 DataProcessingManagement/data/cleaned/mx_tab_inbox/

@@ -1,0 +1,7 @@
+# Prevent Windows autocrlf from corrupting shell scripts that run inside
+# Linux containers (CRLF breaks the shebang line under bash).
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sql text eol=lf
