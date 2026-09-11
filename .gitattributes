@@ -1,0 +1,5 @@
+# This repo is a binary-heavy archive (Docker images, Python/JDK runtimes,
+# wheels, split .partNNNN chunks). Disable line-ending conversion for
+# everything so autocrlf can never corrupt a binary file or a split chunk's
+# byte-for-byte integrity (which SHA256 verification depends on).
+* -text

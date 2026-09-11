@@ -1,0 +1,304 @@
+"""Dagster code location for generated high-column AU-AIR telemetry."""
+
+import json
+import os
+import re
+from pathlib import Path, PurePosixPath
+
+from dagster import (
+    AssetSelection,
+    DagsterRunStatus,
+    DefaultSensorStatus,
+    Definitions,
+    RunRequest,
+    RunsFilter,
+    SkipReason,
+    define_asset_job,
+    run_status_sensor,
+    sensor,
+)
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+import assets
+from alerting import alert_on_failure, clear_alert_on_success
+from clickhouse_workflow import reconcile_auair_clickhouse_run
+from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
+
+
+# The whole generated AU-AIR pipeline is a single job driven by a single
+# sensor: a new raw .tab object triggers one run that stages it, then Spark
+# preprocesses, validates, loads ClickHouse and publishes to DVC. The staged
+# object identity flows between assets through the ``staged_auair_tab`` asset
+# output, so there is no separate staged-data sensor anymore.
+staged_auair_to_published_job = define_asset_job(
+    name="staged_auair_to_published_job",
+    selection=AssetSelection.assets(
+        assets.staged_auair_tab,
+        assets.processed_auair_batch,
+        assets.validated_auair_batch,
+        assets.clickhouse_auair_batch,
+        assets.published_auair_dataset,
+    ),
+    hooks={alert_on_failure, clear_alert_on_success},
+)
+
+
+MONITORED_PIPELINE_JOBS = [
+    staged_auair_to_published_job,
+]
+
+RAW_AUAIR_FILE_PATTERN = re.compile(
+    r"^(?P<row_count>\d+)_(?P<column_count>\d+)_"
+    r"flight_[1-9]\d*_[0-9]{4}-[0-9]{2}-[0-9]{2}\.tab$",
+    flags=re.IGNORECASE,
+)
+
+
+def _record_terminal_status(context, status: str) -> None:
+    repo_root = Path(
+        os.getenv("DVC_REPO_ROOT", Path(__file__).resolve().parents[1])
+    ).resolve()
+    identity = resolve_pipeline_identity(repo_root)
+    record_terminal_job_run(context, identity, status)
+    context.log.info(
+        "PostgreSQL pipeline catalog updated: run=%s, status=%s",
+        context.dagster_run.run_id,
+        status,
+    )
+
+
+def _record_and_reconcile_terminal_status(context, status: str) -> None:
+    """Persist terminal metadata and publish/rollback ClickHouse independently."""
+
+    errors: list[Exception] = []
+    try:
+        _record_terminal_status(context, status)
+    except Exception as error:
+        errors.append(error)
+        context.log.error(
+            "PostgreSQL terminal status could not be recorded: %s",
+            error,
+        )
+
+    dagster_run = context.dagster_run
+    if dagster_run.job_name == staged_auair_to_published_job.name:
+        batch_id = (dagster_run.tags or {}).get("batch_id", "").strip()
+        if not batch_id:
+            error = RuntimeError(
+                "AU-AIR terminal run is missing the batch_id tag: "
+                f"{dagster_run.run_id}"
+            )
+            errors.append(error)
+            context.log.error(str(error))
+        else:
+            try:
+                result = reconcile_auair_clickhouse_run(
+                    batch_id=batch_id,
+                    dagster_run_id=dagster_run.run_id,
+                    commit=status == "SUCCESS",
+                )
+                context.log.info(
+                    "ClickHouse workflow %s: batch=%s, run=%s, rows=%s, "
+                    "skipped=%s",
+                    result.action,
+                    result.batch_id,
+                    result.dagster_run_id,
+                    result.row_count,
+                    result.skipped,
+                )
+            except Exception as error:
+                errors.append(error)
+                context.log.error(
+                    "ClickHouse workflow reconciliation failed for status %s: %s",
+                    status,
+                    error,
+                )
+
+    if errors:
+        raise RuntimeError(
+            "Terminal workflow reconciliation did not complete: "
+            + "; ".join(str(error) for error in errors)
+        ) from errors[0]
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_success_sensor(context):
+    _record_and_reconcile_terminal_status(context, "SUCCESS")
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.FAILURE,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_failure_sensor(context):
+    _record_and_reconcile_terminal_status(context, "FAILURE")
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.CANCELED,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_canceled_sensor(context):
+    _record_and_reconcile_terminal_status(context, "CANCELED")
+
+
+def _job_has_active_run(context, job_name: str) -> bool:
+    active_statuses = [
+        DagsterRunStatus.QUEUED,
+        DagsterRunStatus.NOT_STARTED,
+        DagsterRunStatus.MANAGED,
+        DagsterRunStatus.STARTING,
+        DagsterRunStatus.STARTED,
+        DagsterRunStatus.CANCELING,
+    ]
+    return bool(
+        context.instance.get_runs(
+            filters=RunsFilter(
+                job_name=job_name,
+                statuses=active_statuses,
+            ),
+            limit=1,
+        )
+    )
+
+
+@sensor(
+    job=staged_auair_to_published_job,
+    minimum_interval_seconds=30,
+    default_status=DefaultSensorStatus.RUNNING,
+    description=(
+        "Watches generated high-column AU-AIR .tab objects in MinIO and "
+        "launches one full staging -> Spark -> validation -> ClickHouse -> DVC "
+        "run per object key/ETag."
+    ),
+)
+def raw_auair_minio_sensor(context):
+    if _job_has_active_run(context, staged_auair_to_published_job.name):
+        return SkipReason("An AU-AIR pipeline run is already active.")
+
+    source_bucket = os.getenv("MINIO_RAW_BUCKET", assets.DEFAULT_RAW_BUCKET)
+    source_prefix = os.getenv(
+        "MINIO_AUAIR_RAW_PREFIX", "auair-tab/inbox/"
+    ).strip("/")
+    if source_prefix:
+        source_prefix = f"{source_prefix}/"
+
+    client = assets.create_minio_client()
+    if not client.bucket_exists(source_bucket):
+        return SkipReason(f"MinIO bucket does not exist yet: {source_bucket}")
+
+    try:
+        observed_etags = json.loads(context.cursor) if context.cursor else {}
+    except (TypeError, json.JSONDecodeError):
+        observed_etags = {}
+    if not isinstance(observed_etags, dict):
+        observed_etags = {}
+
+    candidates = sorted(
+        (
+            item
+            for item in client.list_objects(
+                source_bucket,
+                prefix=source_prefix,
+                recursive=True,
+            )
+            if not item.is_dir and item.object_name.lower().endswith(".tab")
+        ),
+        key=lambda item: item.object_name,
+    )
+
+    cursor_changed = False
+    for item in candidates:
+        source_etag = assets._normalise_etag(item.etag) or "unknown"
+        object_identity = f"{source_bucket}/{item.object_name}"
+        if observed_etags.get(object_identity) == source_etag:
+            continue
+
+        file_name = PurePosixPath(item.object_name).name
+        match = RAW_AUAIR_FILE_PATTERN.fullmatch(file_name)
+        if match is None:
+            context.log.warning(
+                "Ignoring raw object with an unsupported generated AU-AIR "
+                "name: s3://%s/%s",
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
+
+        column_count = int(match.group("column_count"))
+        if column_count < assets.AUAIR_MIN_COLUMN_COUNT:
+            context.log.warning(
+                "Ignoring generated AU-AIR object with only %s columns: "
+                "s3://%s/%s",
+                column_count,
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
+
+        batch_id = file_name[: -len(".tab")]
+        observed_etags[object_identity] = source_etag
+        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+        return RunRequest(
+            run_key=f"raw-auair-minio:{object_identity}:{source_etag}",
+            run_config={
+                "ops": {
+                    "staged_auair_tab": {
+                        "config": {
+                            "source_bucket": source_bucket,
+                            "source_key": item.object_name,
+                            "source_etag": source_etag,
+                            "staged_prefix": assets.DEFAULT_STAGED_PREFIX,
+                        }
+                    }
+                }
+            },
+            tags={
+                "dataset_id": assets.DEFAULT_DATASET_ID,
+                "batch_id": batch_id,
+                "source_bucket": source_bucket,
+                "source_key": item.object_name,
+                "source_etag": source_etag,
+                "column_count": str(column_count),
+            },
+        )
+
+    if cursor_changed:
+        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+    return SkipReason(
+        f"No new supported generated AU-AIR .tab objects under "
+        f"s3://{source_bucket}/{source_prefix}."
+    )
+
+
+defs = Definitions(
+    assets=[
+        assets.staged_auair_tab,
+        assets.processed_auair_batch,
+        assets.validated_auair_batch,
+        assets.clickhouse_auair_batch,
+        assets.published_auair_dataset,
+    ],
+    jobs=[
+        staged_auair_to_published_job,
+    ],
+    sensors=[
+        raw_auair_minio_sensor,
+        postgres_run_success_sensor,
+        postgres_run_failure_sensor,
+        postgres_run_canceled_sensor,
+    ],
+)

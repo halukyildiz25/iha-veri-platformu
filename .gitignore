@@ -1,0 +1,32 @@
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+*.egg-info/
+
+# --- Rust ---
+**/target/
+
+# --- generated / runtime data (regenerate via dvc repro or the app itself) ---
+DataProcessingManagement/data/raw/
+DataProcessingManagement/data/cleaned/mx_tab_inbox/
+DataProcessingManagement/dagster/data/raw/
+DataProcessingManagement/dagster/tmp/
+DataProcessingManagement/dagster/.tmp_dagster_home_*/
+DataProcessingManagement/local_data/
+DataProcessingManagement/reports/
+DataProcessingManagement/testdata/
+DataProcessingManagement/.dvc/cache/
+DataProcessingManagement/.dvc/tmp/
+*.tab
+*.parquet
+.env

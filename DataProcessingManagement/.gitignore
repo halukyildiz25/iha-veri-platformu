@@ -1,0 +1,16 @@
+/**/target/
+*.tab
+*.parquet
+__pycache__/
+*.pyc
+/testdata/
+.env
+/tmp/
+reports
+/data/raw/
+/data/cleaned/mx_tab_inbox/
+/dagster/data/raw/
+/dagster/tmp/
+/dagster/.tmp_dagster_home_*/
+.venv
+/local_data/
